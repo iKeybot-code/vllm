@@ -2,12 +2,14 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import dataclasses
 import itertools
+import os
 from collections.abc import Callable
 from typing import Any
 
 import torch
 
 from vllm.config import CacheConfig
+from vllm.logger import init_logger
 from vllm.model_executor.layers.mamba.mamba_utils import (
     MambaStateCopyFunc,
     get_conv_copy_spec,
@@ -20,6 +22,8 @@ from vllm.v1.kv_cache_interface import KVCacheConfig, MambaSpec
 from vllm.v1.utils import CpuGpuBuffer
 from vllm.v1.worker.gpu_input_batch import CachedRequestState
 from vllm.v1.worker.lora_model_runner_mixin import GPUInputBatch
+
+logger = init_logger(__name__)
 
 
 @triton.jit
@@ -581,6 +585,13 @@ def collect_mamba_copy_meta(
     forward_context: dict[str, Any],
 ) -> None:
     if src_block_idx == dest_block_idx and accept_token_bias == 0:
+        if _DEBUG_MAMBA_STATE_IDX:
+            logger.warning(
+                "MAMBA_COPY: Skipped copy (src=dst, bias=0) req_id=%s, "
+                "src_block_idx=%d, dest_block_idx=%d, accept_token_bias=%d",
+                getattr(req_state, 'request_id', 'unknown'),
+                src_block_idx, dest_block_idx, accept_token_bias
+            )
         return
 
     src_ptrs_np = copy_bufs.src_ptrs.np
@@ -590,6 +601,24 @@ def collect_mamba_copy_meta(
 
     for mamba_group_id in mamba_group_ids:
         block_ids = req_state.block_ids[mamba_group_id]
+        
+        if _DEBUG_MAMBA_STATE_IDX:
+            if src_block_idx >= len(block_ids):
+                logger.error(
+                    "MAMBA_COPY: SRC_BLOCK_IDX_OUT_OF_RANGE req_id=%s, "
+                    "src_block_idx=%d >= len(block_ids)=%d, "
+                    "this indicates stale src_block_idx!",
+                    getattr(req_state, 'request_id', 'unknown'),
+                    src_block_idx, len(block_ids)
+                )
+            if dest_block_idx >= len(block_ids):
+                logger.error(
+                    "MAMBA_COPY: DEST_BLOCK_IDX_OUT_OF_RANGE req_id=%s, "
+                    "dest_block_idx=%d >= len(block_ids)=%d",
+                    getattr(req_state, 'request_id', 'unknown'),
+                    dest_block_idx, len(block_ids)
+                )
+        
         dest_block_id = block_ids[dest_block_idx]
         layer_names = kv_cache_config.kv_cache_groups[mamba_group_id].layer_names
         for layer_name in layer_names:
@@ -603,6 +632,19 @@ def collect_mamba_copy_meta(
                 src_ptrs_np[offset] = copy_spec.start_addr
                 dst_ptrs_np[offset] = state[dest_block_id].data_ptr()
                 sizes_np[offset] = copy_spec.num_elements * state.element_size()
+                
+                if _DEBUG_MAMBA_STATE_IDX:
+                    logger.warning(
+                        "MAMBA_COPY: copy scheduled req_id=%s, "
+                        "mamba_group_id=%d, layer=%s, "
+                        "src_block_idx=%d, dest_block_idx=%d, dest_block_id=%d, "
+                        "src_addr=0x%x, dst_addr=0x%x, size=%d",
+                        getattr(req_state, 'request_id', 'unknown'),
+                        mamba_group_id, layer_name,
+                        src_block_idx, dest_block_idx, dest_block_id,
+                        copy_spec.start_addr, state[dest_block_id].data_ptr(),
+                        copy_spec.num_elements * state.element_size()
+                    )
                 offset += 1
 
     copy_bufs.offset = offset
@@ -617,6 +659,9 @@ def do_mamba_copy_block(copy_bufs: MambaCopyBuffers):
         copy_bufs.dst_ptrs.copy_to_gpu(n),
         copy_bufs.sizes.copy_to_gpu(n),
     )
+
+
+_DEBUG_MAMBA_STATE_IDX = os.getenv("VLLM_DEBUG_MAMBA_STATE_IDX", "0") == "1"
 
 
 def cleanup_mamba_state_idx(
@@ -634,7 +679,16 @@ def cleanup_mamba_state_idx(
     preempted_req_ids = scheduler_output.preempted_req_ids or set()
     resumed_req_ids = scheduler_output.scheduled_cached_reqs.resumed_req_ids
     for req_id in itertools.chain(finished_req_ids, preempted_req_ids, resumed_req_ids):
-        mamba_state_idx.pop(req_id, None)
+        old_val = mamba_state_idx.pop(req_id, None)
+        if _DEBUG_MAMBA_STATE_IDX and old_val is not None:
+            logger.warning(
+                "MAMBA_STATE_IDX: cleanup removed req_id=%s, block_idx=%d, "
+                "finished=%s, preempted=%s, resumed=%s",
+                req_id, old_val,
+                req_id in finished_req_ids,
+                req_id in preempted_req_ids,
+                req_id in resumed_req_ids
+            )
 
 
 def preprocess_mamba(
@@ -668,6 +722,12 @@ def preprocess_mamba(
             # new / resumed request, no previous state
             # if num_computed_tokens is 0, prev_state_idx will be -1
             prev_state_idx = (req_state.num_computed_tokens - 1) // block_size
+            if _DEBUG_MAMBA_STATE_IDX:
+                logger.warning(
+                    "MAMBA_STATE_IDX: req_id=%s new/resumed, computed_tokens=%d, "
+                    "prev_state_idx=-1 (computed from num_computed_tokens)",
+                    req_id, req_state.num_computed_tokens
+                )
 
         num_scheduled_tokens = scheduler_output.num_scheduled_tokens[req_id]
         num_blocks: int = (
@@ -686,6 +746,14 @@ def preprocess_mamba(
         # Block 3: speculative block
         # And use block 1 to save the running state.
         curr_state_idx = num_blocks - 1 - num_speculative_blocks
+        if _DEBUG_MAMBA_STATE_IDX:
+            logger.warning(
+                "MAMBA_STATE_IDX: req_id=%s prev=%s curr=%s copy_needed=%s, "
+                "num_computed=%d, num_scheduled=%d, num_blocks=%d",
+                req_id, prev_state_idx, curr_state_idx,
+                (prev_state_idx != -1 and prev_state_idx != curr_state_idx),
+                req_state.num_computed_tokens, num_scheduled_tokens, num_blocks
+            )
         mamba_state_idx[req_id] = curr_state_idx
         if prev_state_idx != -1 and prev_state_idx != curr_state_idx:
             collect_mamba_copy_meta(

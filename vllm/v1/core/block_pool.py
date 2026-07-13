@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
 from collections.abc import Iterable, Sequence
 from typing import Any
 
@@ -29,6 +30,13 @@ from vllm.v1.core.kv_cache_utils import (
 from vllm.v1.request import Request
 
 logger = init_logger(__name__)
+
+# Debug flag for block race detection - can be enabled via env var
+_DEBUG_BLOCK_RACE = os.getenv("VLLM_DEBUG_BLOCK_RACE", "0") == "1"
+# Debug flag for block thrashing detection under high concurrency
+_DEBUG_BLOCK_THRASH = os.getenv("VLLM_DEBUG_BLOCK_THRASH", "0") == "1"
+# Debug flag for detailed mamba state block tracking
+_DEBUG_MAMBA_BLOCK = os.getenv("VLLM_DEBUG_MAMBA_BLOCK", "0") == "1"
 
 
 class BlockHashToBlockMap:
@@ -79,13 +87,29 @@ class BlockHashToBlockMap:
         blocks = self._cache.get(key)
         if blocks is None:
             # When key is not found, attach a single block to the key
+            if _DEBUG_BLOCK_RACE:
+                logger.warning(
+                    "BLOCK_RACE: BlockHashToBlockMap.insert new entry block_id=%d for key=%s",
+                    block.block_id, key[:16].hex() if key else "None"
+                )
             self._cache[key] = block
         elif isinstance(blocks, KVCacheBlock):
             # If there's a block with the same key, merge the original block
             # and the new block into a dict
+            if _DEBUG_BLOCK_RACE:
+                logger.warning(
+                    "BLOCK_RACE: BlockHashToBlockMap.insert COLLISION detected! "
+                    "existing block_id=%d, new block_id=%d, key=%s",
+                    blocks.block_id, block.block_id, key[:16].hex() if key else "None"
+                )
             self._cache[key] = {blocks.block_id: blocks, block.block_id: block}
         elif isinstance(blocks, dict):
             # If it's already a dict, simply insert the block
+            if block.block_id in blocks and _DEBUG_BLOCK_RACE:
+                logger.warning(
+                    "BLOCK_RACE: BlockHashToBlockMap.insert duplicate block_id=%d in dict, key=%s",
+                    block.block_id, key[:16].hex() if key else "None"
+                )
             blocks[block.block_id] = block
         else:
             self._unexpected_blocks_type(blocks)
@@ -341,15 +365,43 @@ class BlockPool:
         Returns:
             A list of new block.
         """
-        if num_blocks > self.get_num_free_blocks():
+        num_free = self.get_num_free_blocks()
+        if num_blocks > num_free:
+            if _DEBUG_BLOCK_RACE:
+                logger.error(
+                    "BLOCK_RACE: Cannot get %d free blocks from the pool, only %d available. "
+                    "This may indicate a race condition in block allocation!",
+                    num_blocks, num_free
+                )
             raise ValueError(f"Cannot get {num_blocks} free blocks from the pool")
 
+        if _DEBUG_BLOCK_RACE and num_blocks > num_free * 0.8:
+            logger.warning(
+                "BLOCK_RACE: Requesting %d blocks when only %d free (%.1f%% usage). "
+                "High block pressure may trigger allocation races!",
+                num_blocks, num_free, (1 - num_free / self.num_gpu_blocks) * 100
+            )
+
         ret: list[KVCacheBlock] = self.free_block_queue.popleft_n(num_blocks)
+
+        if _DEBUG_BLOCK_THRASH:
+            logger.warning(
+                "BLOCK_THRASH: get_new_blocks allocating %d blocks, "
+                "num_free_blocks_before=%d, num_gpu_blocks=%d, usage=%.1f%%",
+                num_blocks, num_free, self.num_gpu_blocks,
+                (1 - num_free / self.num_gpu_blocks) * 100 if self.num_gpu_blocks > 0 else 0
+            )
 
         # In order to only iterate the list once, we duplicated code a bit
         if self.enable_caching:
             for block in ret:
-                self._maybe_evict_cached_block(block)
+                evicted = self._maybe_evict_cached_block(block)
+                if _DEBUG_BLOCK_THRASH and evicted:
+                    logger.warning(
+                        "BLOCK_THRASH: block %d was evicted from prefix cache during allocation, "
+                        "prev_hash=%s, this may indicate high eviction pressure!",
+                        block.block_id, block.block_hash
+                    )
                 assert block.ref_cnt == 0
                 block.ref_cnt += 1
                 if self.metrics_collector:
@@ -360,6 +412,13 @@ class BlockPool:
                 block.ref_cnt += 1
                 if self.metrics_collector:
                     self.metrics_collector.on_block_allocated(block)
+
+        if _DEBUG_BLOCK_THRASH:
+            logger.warning(
+                "BLOCK_THRASH: get_new_blocks completed, %d blocks allocated, "
+                "num_free_blocks_after=%d",
+                len(ret), self.get_num_free_blocks()
+            )
         return ret
 
     def _maybe_evict_cached_block(self, block: KVCacheBlock) -> bool:
@@ -410,9 +469,28 @@ class BlockPool:
         for block in blocks:
             # ref_cnt=0 means this block is in the free list (i.e. eviction
             # candidate), so remove it.
+            old_ref_cnt = block.ref_cnt
             if block.ref_cnt == 0 and not block.is_null:
+                if _DEBUG_BLOCK_RACE:
+                    logger.warning(
+                        "BLOCK_RACE: touch removing block %d from free_queue, "
+                        "ref_cnt=%d, block_hash=%s",
+                        block.block_id, block.ref_cnt, block.block_hash
+                    )
                 self.free_block_queue.remove(block)
             block.ref_cnt += 1
+            if _DEBUG_BLOCK_RACE and old_ref_cnt > 1:
+                logger.warning(
+                    "BLOCK_RACE: touch block %d had ref_cnt=%d (>1 means block in use by multiple requests), "
+                    "block_hash=%s",
+                    block.block_id, old_ref_cnt, block.block_hash
+                )
+            if _DEBUG_BLOCK_RACE and old_ref_cnt < 0:
+                logger.error(
+                    "BLOCK_RACE: touch block %d had NEGATIVE ref_cnt=%d, block_hash=%s, "
+                    "this indicates a ref_cnt tracking bug!",
+                    block.block_id, old_ref_cnt, block.block_hash
+                )
             if self.metrics_collector:
                 self.metrics_collector.on_block_accessed(block)
 
@@ -428,13 +506,39 @@ class BlockPool:
             prepend: Whether to put newly-free blocks at the front of the free
                 queue to be prioritized for reuse.
         """
-        # Materialize the iterable to allow multiple passes.
         blocks_list = list(ordered_blocks)
         for block in blocks_list:
+            if _DEBUG_BLOCK_RACE:
+                logger.warning(
+                    "BLOCK_RACE: free_blocks decrementing block %d ref_cnt from %d to %d, "
+                    "block_hash=%s, prepend=%s",
+                    block.block_id, block.ref_cnt, block.ref_cnt - 1, block.block_hash, prepend
+                )
+            if _DEBUG_BLOCK_THRASH and block.ref_cnt <= 1:
+                logger.warning(
+                    "BLOCK_THRASH: free_blocks block %d ref_cnt=%d (going to 0), "
+                    "num_computed_tokens=%s, block_hash=%s",
+                    block.block_id, block.ref_cnt, getattr(block, 'num_computed_tokens', 'N/A'), block.block_hash
+                )
             block.ref_cnt -= 1
         freed_blocks = [
             block for block in blocks_list if block.ref_cnt == 0 and not block.is_null
         ]
+        if _DEBUG_BLOCK_RACE:
+            logger.warning(
+                "BLOCK_RACE: free_blocks freed %d blocks (of %d total), %d blocks returned to free_queue, "
+                "prepend=%s, num_free_blocks=%d",
+                len([b for b in blocks_list if b.ref_cnt == 0]), len(blocks_list),
+                len(freed_blocks), prepend, self.free_block_queue.num_free_blocks
+            )
+        if _DEBUG_BLOCK_THRASH and len(freed_blocks) > 0:
+            high_usage = (1 - self.get_num_free_blocks() / self.num_gpu_blocks) * 100 if self.num_gpu_blocks > 0 else 0
+            if high_usage > 80:
+                logger.warning(
+                    "BLOCK_THRASH: HIGH USAGE %.1f%% - freeing %d blocks, "
+                    "num_free_blocks_before=%d, may trigger cascade evictions!",
+                    high_usage, len(freed_blocks), self.free_block_queue.num_free_blocks
+                )
         if prepend:
             self.free_block_queue.prepend_n(freed_blocks)
         else:

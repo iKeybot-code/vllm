@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import itertools
-from abc import ABC, abstractmethod
+import os
+from abc import ABC,abstractmethod
 from collections import defaultdict
 from collections.abc import Sequence
 
@@ -27,6 +28,10 @@ from vllm.v1.kv_cache_interface import (
 )
 from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry
 from vllm.v1.request import Request
+from vllm.logger import init_logger
+
+logger = init_logger(__name__)
+_DEBUG_MAMBA_BLOCK = os.getenv("VLLM_DEBUG_MAMBA_BLOCK", "0") == "1"
 
 
 class SingleTypeKVCacheManager(ABC):
@@ -1027,21 +1032,40 @@ class MambaManager(SingleTypeKVCacheManager):
 
         super().remove_skipped_blocks(request_id, num_computed_tokens)
         if self.mamba_cache_mode == "align":
-            # `last_state_block_idx` refers to the block index allocated two steps ago.
-            # The block allocated in the previous step is used to copy Mamba states
-            # into the block allocated in the current step; the earlier block is
-            # no longer needed and should be freed here.
             last_state_block_idx = self.last_state_block_idx.get(request_id)
-            # Blocks allocated during prefill may be non-contiguous. Use
-            # `last_state_block_idx` to free the appropriate block and replace it
-            # with a null block.
+            expected_block_idx = cdiv(num_computed_tokens, self.block_size) - 1
+            
+            if _DEBUG_MAMBA_BLOCK:
+                logger.warning(
+                    "MAMBA_BLOCK: remove_skipped_blocks req_id=%s, "
+                    "last_state_block_idx=%s, expected_block_idx=%d, "
+                    "num_computed_tokens=%d, block_size=%d, mode=align",
+                    request_id, last_state_block_idx, expected_block_idx,
+                    num_computed_tokens, self.block_size
+                )
+            
             if (
                 last_state_block_idx is not None
-                and last_state_block_idx
-                < cdiv(num_computed_tokens, self.block_size) - 1
+                and last_state_block_idx < expected_block_idx
             ):
                 blocks = self.req_to_blocks[request_id]
-                if blocks[last_state_block_idx] != self._null_block:
+                if last_state_block_idx >= len(blocks):
+                    if _DEBUG_MAMBA_BLOCK:
+                        logger.error(
+                            "MAMBA_BLOCK: STALE_STATE_BLOCK_IDX req_id=%s, "
+                            "last_state_block_idx=%d >= len(blocks)=%d, "
+                            "this indicates stale index from a preemption!",
+                            request_id, last_state_block_idx, len(blocks)
+                        )
+                elif blocks[last_state_block_idx] != self._null_block:
+                    if _DEBUG_MAMBA_BLOCK:
+                        logger.warning(
+                            "MAMBA_BLOCK: freeing stale state block req_id=%s, "
+                            "block_idx=%d, block_id=%d, ref_cnt=%d",
+                            request_id, last_state_block_idx,
+                            blocks[last_state_block_idx].block_id,
+                            blocks[last_state_block_idx].ref_cnt
+                        )
                     self.block_pool.free_blocks([blocks[last_state_block_idx]])
                     blocks[last_state_block_idx] = self._null_block
 
@@ -1150,6 +1174,18 @@ class MambaManager(SingleTypeKVCacheManager):
             else:
                 prev_block_len = len(req_blocks)
                 blocks_allocated = request_id in self._allocated_block_reqs
+                
+                if _DEBUG_MAMBA_BLOCK:
+                    logger.warning(
+                        "MAMBA_BLOCK: allocate_new_blocks req_id=%s, "
+                        "prev_block_len=%d, num_required_blocks=%d, "
+                        "blocks_allocated=%s, num_speculative_blocks=%d, "
+                        "num_tokens=%d, num_tokens_main_model=%d",
+                        request_id, prev_block_len, num_required_blocks,
+                        blocks_allocated, self.num_speculative_blocks,
+                        num_tokens, num_tokens_main_model
+                    )
+                
                 # Record the last state block
                 if blocks_allocated:
                     # We always save the running state at the last
@@ -1157,10 +1193,22 @@ class MambaManager(SingleTypeKVCacheManager):
                     self.last_state_block_idx[request_id] = (
                         prev_block_len - 1 - self.num_speculative_blocks
                     )
+                    if _DEBUG_MAMBA_BLOCK:
+                        logger.warning(
+                            "MAMBA_BLOCK: allocate_new_blocks old req, "
+                            "setting last_state_block_idx=%d for req_id=%s",
+                            prev_block_len - 1 - self.num_speculative_blocks, request_id
+                        )
                 elif prev_block_len > 0:
                     # When a new request hits the prefix cache, the last block
                     # saves the hit state.
                     self.last_state_block_idx[request_id] = prev_block_len - 1
+                    if _DEBUG_MAMBA_BLOCK:
+                        logger.warning(
+                            "MAMBA_BLOCK: allocate_new_blocks new req (prefix hit), "
+                            "setting last_state_block_idx=%d for req_id=%s",
+                            prev_block_len - 1, request_id
+                        )
 
                 num_skipped_blocks = (
                     num_required_blocks - self.num_speculative_blocks - 1

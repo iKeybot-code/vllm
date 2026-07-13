@@ -83,6 +83,11 @@ def maybe_convert_block_hash(hash_bytes: BlockHash) -> ExternalBlockHash:
 
 logger = init_logger(__name__)
 
+# Debug flag for block race detection - can be enabled via env var
+_DEBUG_BLOCK_RACE = os.getenv("VLLM_DEBUG_BLOCK_RACE", "0") == "1"
+# Debug flag for block thrashing detection under high concurrency
+_DEBUG_BLOCK_THRASH = os.getenv("VLLM_DEBUG_BLOCK_THRASH", "0") == "1"
+
 # The hash seed for the first block of any prefix block sequence.
 #
 # We use a random value to avoid hash collisions or PYTHONHASHSEED environment
@@ -262,13 +267,35 @@ class FreeKVCacheBlockQueue:
         """
         if n == 0:
             return []
+        if _DEBUG_BLOCK_RACE and self.num_free_blocks < n:
+            logger.error(
+                "BLOCK_RACE: FreeKVCacheBlockQueue popleft_n(%d) but only %d free blocks! "
+                "num_free_blocks is out of sync!",
+                n, self.num_free_blocks
+            )
         assert self.num_free_blocks >= n
+        if _DEBUG_BLOCK_RACE:
+            logger.warning(
+                "BLOCK_RACE: FreeKVCacheBlockQueue popleft_n(%d), before num_free_blocks=%d",
+                n, self.num_free_blocks
+            )
         self.num_free_blocks -= n
+        if _DEBUG_BLOCK_RACE:
+            logger.warning(
+                "BLOCK_RACE: FreeKVCacheBlockQueue popleft_n(%d), after num_free_blocks=%d",
+                n, self.num_free_blocks
+            )
+        if _DEBUG_BLOCK_THRASH:
+            logger.warning(
+                "BLOCK_THRASH: popleft_n(%d) called, remaining_free=%d, "
+                "populated_free=%d",
+                n, self.num_free_blocks, self.num_free_blocks + n
+            )
 
         curr_block = self.fake_free_list_head.next_free_block
         # Pop n blocks from the head of the list
         ret = []
-        for _ in range(n):
+        for i in range(n):
             assert curr_block is not None
             ret.append(curr_block)
             last_block = curr_block
@@ -276,6 +303,12 @@ class FreeKVCacheBlockQueue:
             # Reset prev_free_block and next_free_block of all popped blocks
             last_block.prev_free_block = None
             last_block.next_free_block = None
+            if _DEBUG_BLOCK_THRASH and i == 0:
+                logger.warning(
+                    "BLOCK_THRASH: popping block %d (LRU head), "
+                    "block_hash=%s, ref_cnt=%d",
+                    last_block.block_id, last_block.block_hash, last_block.ref_cnt
+                )
 
         if curr_block is not None:
             # The queue is not empty, connect the fake head to
@@ -291,9 +324,24 @@ class FreeKVCacheBlockQueue:
             block: The block to remove.
         """
         if block.prev_free_block is None or block.next_free_block is None:
-            # This should not happen if the block is from the free list.
-            # It indicates a bug in the caller's logic.
+            if _DEBUG_BLOCK_RACE or _DEBUG_BLOCK_THRASH:
+                logger.error(
+                    "BLOCK_RACE: FreeKVCacheBlockQueue.remove() called on block %d "
+                    "with invalid links (prev=%s, next=%s). This indicates a race condition! "
+                    "num_free_blocks=%d",
+                    block.block_id,
+                    block.prev_free_block.block_id if block.prev_free_block else None,
+                    block.next_free_block.block_id if block.next_free_block else None,
+                    self.num_free_blocks
+                )
             raise RuntimeError(f"remove() called on an invalid block: {block}")
+
+        if _DEBUG_BLOCK_THRASH and self.num_free_blocks < 10:
+            logger.warning(
+                "BLOCK_THRASH: Low free blocks=%d, removing block %d from free queue, "
+                "this may indicate high memory pressure!",
+                self.num_free_blocks, block.block_id
+            )
 
         # Link the previous block to the next block.
         block.prev_free_block.next_free_block = block.next_free_block
@@ -372,6 +420,11 @@ class FreeKVCacheBlockQueue:
         self.fake_free_list_tail.prev_free_block = last_block
 
         self.num_free_blocks += len(blocks)
+        if _DEBUG_BLOCK_RACE:
+            logger.warning(
+                "BLOCK_RACE: FreeKVCacheBlockQueue.append_n(%d blocks), new num_free_blocks=%d",
+                len(blocks), self.num_free_blocks
+            )
 
     def get_all_free_blocks(self) -> list[KVCacheBlock]:
         """Get all free blocks in the free list. Mainly used for testing.
