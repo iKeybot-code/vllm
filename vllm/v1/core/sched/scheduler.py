@@ -975,6 +975,9 @@ class Scheduler(SchedulerInterface):
                         block_aligned_local = (
                             num_new_local_computed_tokens - partial_tail
                         )
+                        request.local_prefix_cache_hit_tokens = (
+                            num_new_local_computed_tokens
+                        )
                         ext_tokens, load_kv_async = (
                             self.connector.get_num_new_matched_tokens(
                                 request, block_aligned_local
