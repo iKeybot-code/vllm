@@ -1,0 +1,124 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 720 448" width="720" height="448" font-family="'SF Pro Text','PingFang SC',system-ui,-apple-system,'Segoe UI',Roboto,sans-serif">
+  <style>
+    :root {
+      color-scheme: light;
+      --surface: #F7F7F8;
+      --surface-muted: #EFEFF2;
+      --text: #171717;
+      --text-muted: #52525B;
+      --border: rgba(23, 23, 23, 0.12);
+      --brand: #4B3FE3;
+      --brand-soft: #F2F7FF;
+      --brand-text: #1A1759;
+      --chart-other: #D3D4DA;
+    }
+    @media (prefers-color-scheme: dark) {
+      :root {
+        color-scheme: dark;
+        --surface: #171717;
+        --surface-muted: #262626;
+        --text: #E5E5E5;
+        --text-muted: #A1A1AA;
+        --border: rgba(229, 229, 229, 0.12);
+        --brand: #6054F1;
+        --brand-soft: #1A1759;
+        --brand-text: #CFD8FF;
+        --chart-other: #D3D4DA;
+      }
+    }
+    .title { fill: var(--text); font: 500 16px/24px var(--font-sans, sans-serif); }
+    .ts { fill: var(--text-muted); font: 400 12px/18px var(--font-sans, sans-serif); }
+    .tsb { fill: var(--brand-text); font: 500 12px/18px var(--font-sans, sans-serif); }
+    .tsf { fill: var(--text); font: 500 12px/18px var(--font-sans, sans-serif); }
+    .cell-a { fill: var(--surface-muted); stroke: var(--border); }
+    .cell-b { fill: var(--surface); stroke: var(--border); }
+    .c-new { fill: var(--brand-soft); stroke: var(--brand); }
+    .c-tail { fill: var(--surface); stroke: var(--border); stroke-dasharray: 3 2; }
+    .jm { stroke: var(--brand); stroke-width: 1.5; stroke-dasharray: 4 3; }
+    .cut { stroke: var(--brand); stroke-width: 2; }
+    .endl { stroke: var(--text-muted); stroke-width: 1; }
+    .dotj { fill: var(--brand); }
+    .dotg { fill: var(--chart-other); }
+  </style>
+
+  <text class="title" x="24" y="34">Mamba block align split：junction 分叉点</text>
+  <text class="ts" x="24" y="56">同一 prefill 请求（100 tokens，block_size = 16）的四种调度结果</text>
+
+  <rect class="cell-a" x="24" y="76" width="92" height="26"/>
+  <rect class="cell-b" x="116" y="76" width="92" height="26"/>
+  <rect class="cell-a" x="208" y="76" width="92" height="26"/>
+  <rect class="cell-b" x="300" y="76" width="93" height="26"/>
+  <rect class="cell-a" x="393" y="76" width="92" height="26"/>
+  <rect class="cell-b" x="485" y="76" width="92" height="26"/>
+  <rect class="cell-b" x="577" y="76" width="23" height="26"/>
+  <circle class="dotg" cx="116" cy="89" r="3.5"/>
+  <circle class="dotg" cx="208" cy="89" r="3.5"/>
+  <circle class="dotg" cx="300" cy="89" r="3.5"/>
+  <circle class="dotg" cx="393" cy="89" r="3.5"/>
+  <circle class="dotg" cx="485" cy="89" r="3.5"/>
+  <circle class="dotj" cx="577" cy="89" r="5"/>
+  <line class="jm" x1="577" y1="66" x2="577" y2="104"/>
+  <rect x="524" y="44" width="106" height="22" rx="11" fill="var(--brand-soft)" stroke="var(--brand)"/>
+  <text class="tsb" x="577" y="59" text-anchor="middle">junction = 96</text>
+  <text class="ts" x="24" y="118" text-anchor="start">0</text>
+  <text class="ts" x="116" y="118" text-anchor="middle">16</text>
+  <text class="ts" x="208" y="118" text-anchor="middle">32</text>
+  <text class="ts" x="300" y="118" text-anchor="middle">48</text>
+  <text class="ts" x="393" y="118" text-anchor="middle">64</text>
+  <text class="ts" x="485" y="118" text-anchor="middle">80</text>
+  <text class="ts" x="577" y="118" text-anchor="middle">96</text>
+
+  <text class="ts" x="24" y="158">① after(72) &lt; junction(96)：num_new = 40 // 16 × 16 = 32</text>
+  <rect class="cell-a" x="24" y="168" width="184" height="24"/>
+  <text class="ts" x="36" y="184">computed 32</text>
+  <rect class="c-new" x="208" y="168" width="185" height="24"/>
+  <text class="tsb" x="220" y="184">new = 32（取整后）</text>
+  <line class="jm" x1="577" y1="164" x2="577" y2="192"/>
+  <text class="ts" x="208" y="210" text-anchor="middle">32</text>
+  <text class="ts" x="393" y="210" text-anchor="middle">64</text>
+  <text class="ts" x="577" y="210" text-anchor="middle">96</text>
+
+  <text class="ts" x="24" y="226">② 80 &lt; junction(96) &lt; after(120)：num_new = 96 − 80 = 16</text>
+  <rect class="cell-a" x="24" y="236" width="461" height="24"/>
+  <text class="ts" x="36" y="252">computed 80</text>
+  <rect class="c-new" x="485" y="236" width="92" height="24"/>
+  <text class="tsb" x="493" y="252">new = 16</text>
+  <rect class="c-tail" x="577" y="236" width="23" height="24"/>
+  <line class="jm" x1="577" y1="232" x2="577" y2="260"/>
+  <line class="endl" x1="600" y1="232" x2="600" y2="260"/>
+  <text class="ts" x="485" y="278" text-anchor="middle">80</text>
+  <text class="tsf" x="577" y="278" text-anchor="middle">96</text>
+  <text class="ts" x="600" y="278" text-anchor="middle">100</text>
+
+  <text class="ts" x="24" y="294">③ computed 已过 junction：尾部 4 tokens 不缓存，直接调度</text>
+  <rect class="cell-a" x="24" y="304" width="553" height="24"/>
+  <text class="ts" x="36" y="320">computed 96</text>
+  <rect class="c-tail" x="577" y="304" width="23" height="24"/>
+  <line class="jm" x1="577" y1="300" x2="577" y2="328"/>
+  <line class="endl" x1="600" y1="300" x2="600" y2="328"/>
+  <text class="ts" x="577" y="346" text-anchor="middle">96</text>
+  <text class="ts" x="600" y="346" text-anchor="middle">100</text>
+
+  <text class="ts" x="24" y="362">④ 检测到未缓存公共前缀 64 ≥ block_size：num_new 砍到 64 并对齐</text>
+  <rect class="c-new" x="24" y="372" width="369" height="24"/>
+  <text class="tsb" x="36" y="388">new = 64（公共前缀边界）</text>
+  <rect class="c-tail" x="393" y="372" width="207" height="24"/>
+  <text class="ts" x="405" y="388">下一 step 再算</text>
+  <line class="cut" x1="393" y1="368" x2="393" y2="396"/>
+  <line class="jm" x1="577" y1="368" x2="577" y2="396"/>
+  <line class="endl" x1="600" y1="368" x2="600" y2="396"/>
+  <text class="tsf" x="393" y="410" text-anchor="middle">64</text>
+  <text class="ts" x="577" y="410" text-anchor="middle">96</text>
+  <text class="ts" x="600" y="410" text-anchor="middle">100</text>
+
+  <rect class="cell-a" x="24" y="418" width="14" height="14" rx="3"/>
+  <text class="ts" x="46" y="430">computed 已计算</text>
+  <rect class="c-new" x="152" y="418" width="14" height="14" rx="3"/>
+  <text class="ts" x="174" y="430">new 本 step 新算</text>
+  <rect class="c-tail" x="288" y="418" width="14" height="14" rx="3"/>
+  <text class="ts" x="310" y="430">未调度（下个 step）</text>
+  <circle class="dotj" cx="442" cy="425" r="4.5"/>
+  <text class="ts" x="454" y="430">junction 分叉点</text>
+  <circle class="dotg" cx="572" cy="425" r="4"/>
+  <text class="ts" x="584" y="430">block 边界缓存点</text>
+</svg>
