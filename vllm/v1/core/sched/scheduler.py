@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import itertools
 import time
-from collections import defaultdict, deque
+from collections import OrderedDict, defaultdict, deque
 from collections.abc import Iterable
 from dataclasses import replace
 from typing import Any
@@ -426,6 +426,15 @@ class Scheduler(SchedulerInterface):
             or group.kv_cache_spec.num_prefill_checkpoint_blocks > 0
             for group in kv_cache_config.kv_cache_groups
         )
+        self.mamba_prefill_checkpoint_max_tokens = min(
+            (
+                group.kv_cache_spec.prefill_checkpoint_max_tokens
+                for group in kv_cache_config.kv_cache_groups
+                if isinstance(group.kv_cache_spec, MambaSpec)
+                and group.kv_cache_spec.prefill_checkpoint_max_tokens is not None
+            ),
+            default=self.max_model_len,
+        )
         # Fine-grained hits reuse the prompt's hash-aligned Mamba checkpoint.
         # Split there only if the backend cannot save it within the final chunk.
         self.mamba_partial_cache_hit = (
@@ -440,6 +449,20 @@ class Scheduler(SchedulerInterface):
         self.mamba_shared_prefix_checkpoint = (
             self.mamba_partial_cache_hit
             and self.kv_cache_manager.mamba_shared_prefix_checkpoint
+        )
+
+        # Keep the hash only. The exact tail has to be observed again before
+        # the allocator spends a separate prefill on an exclusive suffix.
+        observe_short_mamba_tails = (
+            self.connector is None
+            and self.mamba_has_prefill_checkpoint_blocks
+            and self.mamba_partial_cache_hit
+            and (vllm_config.additional_config or {}).get(
+                "gdn_elide_singleton_warm_tail", False
+            )
+        )
+        self._short_mamba_tail_history: OrderedDict[bytes, None] | None = (
+            OrderedDict() if observe_short_mamba_tails else None
         )
 
         # Counts of non-empty steps scheduled / processed. update_from_output
@@ -578,7 +601,7 @@ class Scheduler(SchedulerInterface):
         )
         use_internal_checkpoint = (
             self.mamba_has_prefill_checkpoint_blocks
-            and end >= prefill_end
+            and prefill_end <= end <= self.mamba_prefill_checkpoint_max_tokens
             and is_mamba_prefill_checkpoint_valid(
                 query_start=start,
                 query_end=end,
@@ -615,6 +638,16 @@ class Scheduler(SchedulerInterface):
             if self.mamba_partial_cache_hit and not use_internal_checkpoint
             else 0
         )
+        if (
+            request.mamba_first_observed_tail
+            and start == num_new_local_computed_tokens > 0
+            and start % block_size == 0
+            and start < tail_boundary < request.num_prompt_tokens <= start + block_size
+            and prefill_end == request.num_prompt_tokens <= end
+        ):
+            # The physical checkpoint is already reusable. Keep it and avoid
+            # publishing an unwritten checkpoint for a first-seen suffix.
+            tail_boundary = 0
         junction = request.shared_prefix_boundary
         # Block-floored: a sub-block junction's state is not separately cacheable.
         block_floored = start + (junction - start) // block_size * block_size
@@ -3009,6 +3042,37 @@ class Scheduler(SchedulerInterface):
     def has_request(self, request_id: str) -> bool:
         return request_id in self.requests
 
+    def _observe_short_mamba_tail(self, request: Request) -> None:
+        history = self._short_mamba_tail_history
+        block_size = self.cache_config.block_size
+        if (
+            history is None
+            or request.resumable
+            or not block_size
+            < request.num_prompt_tokens
+            <= self.mamba_prefill_checkpoint_max_tokens
+        ):
+            return
+        tail = get_mamba_prefill_checkpoint_position(
+            request.num_prompt_tokens,
+            self.hash_block_size,
+            self.use_eagle_block_drop,
+            num_hash_lookahead_tokens=self.num_hash_lookahead_tokens,
+        )
+        hash_index = tail // self.hash_block_size - 1
+        if (
+            tail <= block_size
+            or tail % block_size == 0
+            or hash_index >= len(request.block_hashes)
+        ):
+            return
+        key = request.block_hashes[hash_index]
+        request.mamba_first_observed_tail = key not in history
+        history[key] = None
+        history.move_to_end(key)
+        if len(history) > 4096:
+            history.popitem(last=False)
+
     def add_request(self, request: Request) -> None:
         existing = self.requests.get(request.request_id)
         if existing is not None:
@@ -3029,6 +3093,7 @@ class Scheduler(SchedulerInterface):
             if self.connector is not None:
                 # Before enqueueing: may_load_async can use what this records.
                 self.connector.on_new_request(request)
+            self._observe_short_mamba_tail(request)
             self._enqueue_waiting_request(request)
             self.requests[request.request_id] = request
             if self.spec_decode_metrics_level != "none":
@@ -3301,6 +3366,9 @@ class Scheduler(SchedulerInterface):
 
         if reset_connector:
             reset_successful = self.reset_connector_cache() and reset_successful
+
+        if reset_successful and self._short_mamba_tail_history is not None:
+            self._short_mamba_tail_history.clear()
 
         if reset_successful and self.aux_output_connector is not None:
             self.aux_output_connector.reset()

@@ -1144,6 +1144,8 @@ class MambaSpec(KVCacheSpec):
     # False: the state is sharded across TP ranks (e.g. GDN). True: every TP
     # rank holds the full state (e.g. the replicated PLE conv state).
     tp_replicated: bool = False
+    prefer_short_physical_checkpoint: bool = False
+    prefill_checkpoint_max_tokens: int | None = None
 
     def __post_init__(self):
         super().__post_init__()
@@ -1203,6 +1205,9 @@ class MambaSpec(KVCacheSpec):
             and spec.num_speculative_blocks == self.num_speculative_blocks
             and spec.num_prefill_checkpoint_blocks == self.num_prefill_checkpoint_blocks
             and spec.prefill_checkpoint_alignment == self.prefill_checkpoint_alignment
+            and spec.prefer_short_physical_checkpoint
+            == self.prefer_short_physical_checkpoint
+            and spec.prefill_checkpoint_max_tokens == self.prefill_checkpoint_max_tokens
             and spec.page_size_bytes == self.page_size_bytes
             and spec.state_alignment == self.state_alignment
             and spec.tp_replicated == self.tp_replicated
@@ -1228,6 +1233,23 @@ def get_mamba_prefill_checkpoint_position(
     if drop_eagle_block:
         checkpoint_position -= hash_block_size
     return max(checkpoint_position, 0)
+
+
+def prefer_short_mamba_physical_checkpoint(
+    position: int, query_start: int, query_end: int, spec: MambaSpec
+) -> int:
+    """Keep the physical prefix for a cold prefill spanning two pages."""
+    block_size = spec.block_size
+    alignment = spec.prefill_checkpoint_alignment
+    if (
+        spec.prefer_short_physical_checkpoint
+        and alignment is not None
+        and block_size % alignment == 0
+        and query_start == 0
+        and block_size < position < query_end <= 2 * block_size
+    ):
+        return block_size
+    return position
 
 
 def is_mamba_prefill_checkpoint_valid(

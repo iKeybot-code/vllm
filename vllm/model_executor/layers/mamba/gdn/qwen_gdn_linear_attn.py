@@ -909,6 +909,14 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             spec,
             num_prefill_checkpoint_blocks=1,
             prefill_checkpoint_alignment=get_mamba_prefill_checkpoint_grid(vllm_config),
+            prefer_short_physical_checkpoint=bool(
+                (vllm_config.additional_config or {}).get(
+                    "gdn_native_preserve_physical_prefix", False
+                )
+            ),
+            prefill_checkpoint_max_tokens=(vllm_config.additional_config or {}).get(
+                "gdn_native_checkpoint_max_tokens"
+            ),
         )
 
     @functools.cached_property

@@ -15,6 +15,7 @@ from vllm.v1.kv_cache_interface import (
     MambaSpec,
     get_mamba_prefill_checkpoint_position,
     is_mamba_prefill_checkpoint_valid,
+    prefer_short_mamba_physical_checkpoint,
 )
 
 
@@ -27,6 +28,7 @@ def compute_mamba_prefill_checkpoints(
     drop_eagle_block: bool,
     cache_hit_alignment_tokens: int,
     num_hash_lookahead_tokens: int = 0,
+    kv_cache_spec: MambaSpec | None = None,
 ) -> tuple[list[int], list[int]]:
     """Per-row internal prefill checkpoint offsets and cache block columns.
 
@@ -42,7 +44,16 @@ def compute_mamba_prefill_checkpoints(
     """
     offsets: list[int] = []
     cols: list[int] = []
+    max_tokens = (
+        kv_cache_spec.prefill_checkpoint_max_tokens
+        if kv_cache_spec is not None
+        else None
+    )
     for seq_len, query_len in zip(seq_lens, query_lens):
+        if max_tokens is not None and seq_len > max_tokens:
+            offsets.append(0)
+            cols.append(-1)
+            continue
         query_start = seq_len - query_len
         position = get_mamba_prefill_checkpoint_position(
             seq_len,
@@ -50,6 +61,10 @@ def compute_mamba_prefill_checkpoints(
             drop_eagle_block=drop_eagle_block,
             num_hash_lookahead_tokens=num_hash_lookahead_tokens,
         )
+        if kv_cache_spec is not None:
+            position = prefer_short_mamba_physical_checkpoint(
+                position, query_start, seq_len, kv_cache_spec
+            )
         valid = is_mamba_prefill_checkpoint_valid(
             query_start=query_start,
             query_end=seq_len,
@@ -139,6 +154,7 @@ class MambaPrefillCheckpointBuilder:
             drop_eagle_block=self.drop_eagle_block,
             cache_hit_alignment_tokens=cache_hit_alignment_tokens,
             num_hash_lookahead_tokens=self.vllm_config.num_hash_lookahead_tokens,
+            kv_cache_spec=self.kv_cache_spec,
         )
         if not any(checkpoint_offsets):
             return None

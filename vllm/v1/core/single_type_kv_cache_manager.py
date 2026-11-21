@@ -39,6 +39,7 @@ from vllm.v1.kv_cache_interface import (
     SlidingWindowSpec,
     get_mamba_prefill_checkpoint_position,
     is_mamba_prefill_checkpoint_valid,
+    prefer_short_mamba_physical_checkpoint,
 )
 from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry
 from vllm.v1.request import Request
@@ -1672,8 +1673,10 @@ class MambaManager(SingleTypeKVCacheManager):
         assert isinstance(self.kv_cache_spec, MambaSpec)
         checkpoint_idx = cdiv(query_end, self.block_size) - 2
         blocks = self.req_to_blocks[request_id]
+        max_tokens = self.kv_cache_spec.prefill_checkpoint_max_tokens
         return (
             self.has_prefill_checkpoint_blocks
+            and (max_tokens is None or query_end <= max_tokens)
             and query_end >= prefill_end
             and is_mamba_prefill_checkpoint_valid(
                 query_start=query_start,
@@ -1768,6 +1771,12 @@ class MambaManager(SingleTypeKVCacheManager):
                 self.cache_hit_alignment_tokens,
                 self.drop_eagle_checkpoint_block,
                 num_hash_lookahead_tokens=self.block_pool.num_hash_lookahead_tokens,
+            )
+            checkpoint_position = prefer_short_mamba_physical_checkpoint(
+                checkpoint_position,
+                total_computed_tokens,
+                num_tokens,
+                self.kv_cache_spec,
             )
             if not self._needs_internal_checkpoint(
                 request_id,
