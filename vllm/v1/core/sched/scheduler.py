@@ -426,6 +426,11 @@ class Scheduler(SchedulerInterface):
             or group.kv_cache_spec.num_prefill_checkpoint_blocks > 0
             for group in kv_cache_config.kv_cache_groups
         )
+        self.mamba_preserves_physical_prefill_stops = any(
+            isinstance(group.kv_cache_spec, MambaSpec)
+            and group.kv_cache_spec.prefer_short_physical_checkpoint
+            for group in kv_cache_config.kv_cache_groups
+        )
         self.mamba_prefill_checkpoint_max_tokens = min(
             (
                 group.kv_cache_spec.prefill_checkpoint_max_tokens
@@ -602,6 +607,10 @@ class Scheduler(SchedulerInterface):
         use_internal_checkpoint = (
             self.mamba_has_prefill_checkpoint_blocks
             and prefill_end <= end <= self.mamba_prefill_checkpoint_max_tokens
+            and not (
+                self.mamba_preserves_physical_prefill_stops
+                and checkpoint_position % block_size == 0
+            )
             and is_mamba_prefill_checkpoint_valid(
                 query_start=start,
                 query_end=end,

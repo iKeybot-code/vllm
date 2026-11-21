@@ -1240,6 +1240,9 @@ def prefer_short_mamba_physical_checkpoint(
 ) -> int:
     """Keep the physical prefix for a cold prefill spanning two pages."""
     block_size = spec.block_size
+    if spec.prefer_short_physical_checkpoint and position % block_size == 0:
+        # The baseline already stops here to retain the physical page.
+        return 0
     alignment = spec.prefill_checkpoint_alignment
     if (
         spec.prefer_short_physical_checkpoint
